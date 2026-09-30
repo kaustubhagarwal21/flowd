@@ -1,0 +1,10 @@
+# Binaries
+/bin/
+/flowd
+*.exe
+*.test
+
+# Coverage and profiles
+*.out
+*.cover
+coverage.*

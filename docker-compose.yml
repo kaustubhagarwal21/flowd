@@ -1,0 +1,39 @@
+# Local stack: PostgreSQL 16 and flowd.
+#   docker compose up --build
+# The API is then at http://localhost:8080.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: flowd
+      POSTGRES_PASSWORD: flowd
+      POSTGRES_DB: flowd
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flowd -d flowd"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  flowd:
+    build: .
+    depends_on:
+      # Start flowd only once PostgreSQL accepts connections.
+      postgres:
+        condition: service_healthy
+    environment:
+      FLOWD_ADDR: ":8080"
+      FLOWD_DATABASE_URL: postgres://flowd:flowd@postgres:5432/flowd?sslmode=disable
+      FLOWD_WORKERS: "8"
+      FLOWD_LEASE: 30s
+      FLOWD_POLL: 200ms
+    ports:
+      # The API has no authentication, so publish it on localhost only.
+      - "127.0.0.1:8080:8080"
+    # Room for the graceful shutdown (in-flight requests and steps) before
+    # Docker sends SIGKILL.
+    stop_grace_period: 30s
+
+volumes:
+  pgdata:

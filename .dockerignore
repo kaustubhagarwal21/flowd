@@ -1,0 +1,7 @@
+# Keep the build context small: the image only needs the Go sources.
+.git
+.github
+bin/
+*.md
+*.out
+*.test

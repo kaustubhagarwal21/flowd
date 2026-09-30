@@ -451,6 +451,12 @@ func TestCancelRun(t *testing.T) {
 		wantProblem(t, do(t, a.handler, "POST", "/v1/runs/"+run.ID+"/cancel", "", ""), http.StatusConflict)
 	}
 	wantProblem(t, do(t, a.handler, "POST", "/v1/runs/run-missing/cancel", "", ""), http.StatusNotFound)
+
+	// The run counts as cancelled once, however often it was cancelled.
+	metricsBody := do(t, a.handler, "GET", "/metrics", "", "").Body.String()
+	if !strings.Contains(metricsBody, `flowd_runs_finished_total{status="cancelled"} 1`+"\n") {
+		t.Errorf("/metrics does not count exactly one cancelled run")
+	}
 }
 
 func TestHealthz(t *testing.T) {

@@ -164,7 +164,17 @@ func (s *server) listRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	run, err := s.store.CancelRun(r.Context(), id)
+	// CancelRun returns an already cancelled run unchanged, so its answer
+	// cannot say whether this request did the cancelling. Reading the run
+	// first lets flowd_runs_finished_total count a cancelled run once, not
+	// once per repeated request. (Two cancels racing each other can still
+	// both count it.) The engine never sees a cancelled run finish, so this
+	// is the only place that can count it.
+	before, err := s.store.GetRun(r.Context(), id)
+	var run store.Run
+	if err == nil {
+		run, err = s.store.CancelRun(r.Context(), id)
+	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeProblem(w, r, http.StatusNotFound, fmt.Sprintf("run %q not found", id))
@@ -173,6 +183,9 @@ func (s *server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.internalError(w, r, err)
 	default:
+		if before.Status == store.RunRunning {
+			s.metrics.RunFinished(string(store.RunCancelled))
+		}
 		s.writeJSON(w, r, http.StatusOK, run)
 	}
 }

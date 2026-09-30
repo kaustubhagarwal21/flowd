@@ -1,0 +1,567 @@
+openapi: 3.0.3
+info:
+  title: flowd API
+  version: 0.1.0
+  description: |
+    flowd runs workflows (DAGs of steps) durably on PostgreSQL.
+
+    Conventions:
+    - Request bodies must be JSON sent with `Content-Type: application/json`
+      (otherwise 415), at most 1 MiB (otherwise 413), and hold exactly one
+      JSON value with no unknown fields (otherwise 400).
+    - Every error is an RFC 7807 problem with `Content-Type: application/problem+json`.
+      This includes 404 for unknown paths and 405 (with an `Allow` header)
+      for unsupported methods.
+    - GET routes also answer HEAD.
+    - There is no authentication; run flowd on a trusted network.
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: workflows
+  - name: runs
+  - name: operations
+paths:
+  /v1/workflows:
+    post:
+      tags: [workflows]
+      operationId: createWorkflow
+      summary: Validate and store a workflow definition
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Definition'
+            example:
+              name: deploy-demo
+              steps:
+                - id: build
+                  type: http
+                  http:
+                    method: POST
+                    url: http://build.internal/start
+                  retry:
+                    max_attempts: 3
+                    initial_backoff_ms: 200
+                    max_backoff_ms: 5000
+                  timeout_ms: 10000
+                - id: test
+                  type: noop
+                  depends_on: [build]
+      responses:
+        '201':
+          description: Stored. The body is the workflow with every default filled in.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workflow'
+        '400':
+          description: |
+            The body is not valid JSON, has unknown fields, or the definition
+            fails validation. A validation problem carries a `field` member
+            naming the invalid part, e.g. `steps[1].depends_on`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              example:
+                type: about:blank
+                title: Bad Request
+                status: 400
+                detail: step "test" depends on unknown step "biuld"
+                instance: /v1/workflows
+                field: steps[1].depends_on
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/workflows/{id}:
+    get:
+      tags: [workflows]
+      operationId: getWorkflow
+      summary: Get a workflow
+      parameters:
+        - $ref: '#/components/parameters/WorkflowID'
+      responses:
+        '200':
+          description: The workflow.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workflow'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/workflows/{id}/runs:
+    post:
+      tags: [runs]
+      operationId: createRun
+      summary: Start a run of a workflow
+      description: |
+        The body is optional. The run is queued and the engine executes it in
+        the background, so the answer is 202 with the new run's ID; poll
+        `GET /v1/runs/{id}` (the `Location` header) for progress.
+      parameters:
+        - $ref: '#/components/parameters/WorkflowID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRunRequest'
+            example:
+              input:
+                env: staging
+      responses:
+        '202':
+          description: The run was created and queued.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateRunResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/runs:
+    get:
+      tags: [runs]
+      operationId: listRuns
+      summary: List runs, newest first
+      description: |
+        Keyset pagination: pass `next_cursor` from one page as `cursor` to get
+        the next. The last page has no `next_cursor`. Runs in a list do not
+        include their steps.
+      parameters:
+        - name: workflow_id
+          in: query
+          description: Only runs of this workflow.
+          schema:
+            type: string
+        - name: status
+          in: query
+          description: Only runs with this status.
+          schema:
+            $ref: '#/components/schemas/RunStatus'
+        - name: limit
+          in: query
+          description: Page size.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          description: Opaque cursor from the previous page's `next_cursor`.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: One page of runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/runs/{id}:
+    get:
+      tags: [runs]
+      operationId: getRun
+      summary: Get a run with the state of each step
+      parameters:
+        - $ref: '#/components/parameters/RunID'
+      responses:
+        '200':
+          description: The run, with its steps in topological order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/runs/{id}/cancel:
+    post:
+      tags: [runs]
+      operationId: cancelRun
+      summary: Cancel a run
+      description: |
+        Pending and ready steps are cancelled at once; running steps stop at
+        their next heartbeat and their results are discarded. Cancelling a
+        run that is already cancelled returns it unchanged. No request body
+        is needed.
+      parameters:
+        - $ref: '#/components/parameters/RunID'
+      responses:
+        '200':
+          description: The cancelled run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The run already succeeded or failed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /healthz:
+    get:
+      tags: [operations]
+      operationId: healthz
+      summary: Health check (pings the database)
+      responses:
+        '200':
+          description: The database answered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: The database ping failed or took longer than 2 seconds.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /metrics:
+    get:
+      tags: [operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      responses:
+        '200':
+          description: Metrics in the Prometheus text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  parameters:
+    WorkflowID:
+      name: id
+      in: path
+      required: true
+      description: Workflow ID.
+      schema:
+        type: string
+    RunID:
+      name: id
+      in: path
+      required: true
+      description: Run ID.
+      schema:
+        type: string
+  headers:
+    Location:
+      description: Path of the created resource.
+      schema:
+        type: string
+  responses:
+    BadRequest:
+      description: Malformed body or invalid query parameter.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: No workflow or run with that ID.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: The request body is larger than 1 MiB.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: The request body is not sent as application/json.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalError:
+      description: The server failed; details are in its log, not in the response.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      description: An RFC 7807 problem details object.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: Always `about:blank`; the status code identifies the problem.
+          example: about:blank
+        title:
+          type: string
+          description: The standard text for the status code.
+          example: Not Found
+        status:
+          type: integer
+          example: 404
+        detail:
+          type: string
+          description: What went wrong, for a human reader.
+          example: run "run-123" not found
+        instance:
+          type: string
+          description: The request path.
+          example: /v1/runs/run-123
+        field:
+          type: string
+          description: |
+            Only on workflow validation errors: the invalid part of the
+            definition.
+          example: steps[1].depends_on
+    Definition:
+      type: object
+      description: A workflow as submitted. Unknown fields are rejected.
+      required: [steps]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          example: deploy-demo
+        steps:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Step'
+    Step:
+      type: object
+      description: |
+        One node of the DAG. Dependencies must name other steps of the same
+        workflow, at most once each, and must not form a cycle. An `http`
+        step needs `http` settings and no `noop`; a `noop` step may have
+        `noop` settings and no `http`.
+      required: [id, type]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z0-9_-]{1,64}$'
+          example: build
+        type:
+          type: string
+          enum: [http, noop]
+        depends_on:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+          example: [build]
+        http:
+          $ref: '#/components/schemas/HTTPSpec'
+        noop:
+          $ref: '#/components/schemas/NoopSpec'
+        retry:
+          $ref: '#/components/schemas/RetryPolicy'
+        timeout_ms:
+          type: integer
+          minimum: 0
+          description: |
+            Deadline of each attempt. 0 or absent means 30000 (30 s); values
+            above 600000 (10 min) are lowered to 600000.
+    HTTPSpec:
+      type: object
+      description: |
+        Settings of an `http` step. Any 2xx answer is success. Every attempt
+        sends `Idempotency-Key: <run_id>/<step_id>`, which stays the same
+        across retries.
+      required: [method, url]
+      additionalProperties: false
+      properties:
+        method:
+          type: string
+          description: One of GET, HEAD, POST, PUT, PATCH, DELETE, in any case; stored in upper case.
+          example: POST
+        url:
+          type: string
+          description: An absolute http or https URL.
+          example: http://build.internal/start
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        body:
+          description: Any JSON value, sent as the request body.
+    NoopSpec:
+      type: object
+      description: Settings of a `noop` step, for demos and tests.
+      additionalProperties: false
+      properties:
+        sleep_ms:
+          type: integer
+          minimum: 0
+          maximum: 600000
+          description: How long the step sleeps.
+        fail_times:
+          type: integer
+          minimum: 0
+          description: The first this-many attempts fail on purpose, to show retries.
+    RetryPolicy:
+      type: object
+      description: |
+        How often and how fast a failed step is retried (exponential backoff
+        with full jitter). 0 or absent means the default; values above a cap
+        are lowered to the cap.
+      additionalProperties: false
+      properties:
+        max_attempts:
+          type: integer
+          minimum: 0
+          description: Attempts in total, including the first. Default 3, cap 10.
+        initial_backoff_ms:
+          type: integer
+          minimum: 0
+          description: Delay ceiling before the first retry. Default 200; never more than max_backoff_ms.
+        max_backoff_ms:
+          type: integer
+          minimum: 0
+          description: Cap on the delay between retries. Default 30000, cap 600000.
+    Workflow:
+      type: object
+      required: [id, name, definition, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        definition:
+          $ref: '#/components/schemas/Definition'
+        created_at:
+          type: string
+          format: date-time
+    CreateRunRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        input:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Input for the run; must be a JSON object. null means no input.
+    CreateRunResponse:
+      type: object
+      required: [run_id]
+      properties:
+        run_id:
+          type: string
+    RunStatus:
+      type: string
+      enum: [running, succeeded, failed, cancelled]
+    StepStatus:
+      type: string
+      description: |
+        pending waits for its dependencies; ready can be claimed; running is
+        leased by a worker; succeeded, failed, skipped (an upstream step
+        failed) and cancelled are final.
+      enum: [pending, ready, running, succeeded, failed, skipped, cancelled]
+    Run:
+      type: object
+      required: [id, workflow_id, status, created_at]
+      properties:
+        id:
+          type: string
+        workflow_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        input:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: The run's input; absent when the run was started without one.
+        created_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        steps:
+          type: array
+          description: Present in `GET /v1/runs/{id}`, in topological order; absent in lists.
+          items:
+            $ref: '#/components/schemas/StepState'
+    StepState:
+      type: object
+      required: [step_id, status, attempt, max_attempts]
+      properties:
+        step_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/StepStatus'
+        attempt:
+          type: integer
+          description: Attempts started so far, including a re-claim after a crash.
+        max_attempts:
+          type: integer
+        depends_on:
+          type: array
+          items:
+            type: string
+        last_error:
+          type: string
+        output:
+          description: |
+            What the step produced. An http step gives
+            `{"status": <code>, "body": <the response body>}`, where the body
+            (at most 16 KiB) is embedded as JSON when it is valid JSON and as
+            a string otherwise.
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+    RunList:
+      type: object
+      required: [runs]
+      properties:
+        runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Run'
+        next_cursor:
+          type: string
+          description: Cursor for the next page; absent on the last page.
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]

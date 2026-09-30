@@ -581,23 +581,24 @@ claim, the completion transaction, and the promotion of dependents.
 
 | Workers | Throughput (steps/s) | Wall time | Run latency p50 | Run latency p99 | Time to submit 2,000 runs |
 |---|---|---|---|---|---|
-| 8 | **1,243.5** (1,108.5 to 1,278.5) | 9.651 s (9.386 to 10.826) | 6.220 s (5.990 to 6.619) | 7.438 s (7.216 to 8.032) | 3.221 s (3.156 to 3.936) |
-| 32 | **2,311.2** (2,241.4 to 2,352.2) | 5.192 s (5.102 to 5.354) | 21 ms (20 to 22) | 32 ms (32 to 39) | 5.173 s (5.081 to 5.335) |
+| 8 | **1,356.4** (1,320.9 to 2,464.7) | 8.847 s (4.869 to 9.084) | 5.664 s (2.270 to 5.735) | 6.797 s (2.683 to 6.917) | 2.849 s (2.727 to 3.130) |
+| 32 | **2,587.3** (2,517.2 to 2,636.5) | 4.638 s (4.552 to 4.767) | 19 ms (19 to 19) | 28 ms (26 to 29) | 4.619 s (4.534 to 4.749) |
 
 Each cell is the median of 3 runs, with the range in parentheses.
 
 - **8 workers.** The engine is the bottleneck. Submitting took about 3 s,
-  and draining took about 9.7 s. Runs queue behind earlier runs, so their
-  latency is seconds.
+  and draining took about 8.8 s. Runs queue behind earlier runs, so their
+  latency is seconds. One of the three runs was much faster (2,464.7 steps/s)
+  for no reason we could find; the median does not depend on it.
 - **32 workers.** The engine kept up with the submitting goroutine. Each run
-  finished about 21 ms (median) after it was created, and the wall time is
+  finished about 19 ms (median) after it was created, and the wall time is
   essentially the time it took to submit the runs. The 32-worker figure is
   therefore the rate at which the benchmark created work. It is a lower
   bound for what 32 workers can drain, not their limit.
 
 How the numbers were taken:
 
-- **Commands.** From the repository root:
+- **Commands.** At commit `c486672`, from the repository root:
   ```sh
   export FLOWD_DATABASE_URL='postgres://kaustubh@127.0.0.1:55432/flowd_test?sslmode=disable'
   go build -o bin/flowd-bench ./cmd/flowd-bench
@@ -610,9 +611,10 @@ How the numbers were taken:
   between runs.
   - A run started only after 5 s in which no other Go build, Go test or
     `psql` process was running in WSL2.
-  - A script checked for such processes every 0.2 s during each run. Two runs
-    still overlapped another program's `go build` or `go test`. They were
-    discarded and repeated, as the rule said beforehand.
+  - A script checked for such processes every 0.2 s during each run. A run
+    that overlapped one would have been discarded and repeated, as the rule
+    said beforehand. All nine runs (the six above and the three control runs
+    below) were clean.
 - **What the timing includes.** The time is measured from the first run's
   `created_at` to the last run's `finished_at`, both from the database
   clock. It covers submitting every run (which overlaps with execution) and
@@ -654,16 +656,16 @@ Where the time goes:
   nothing to run, or at most once a second per instance while claims keep
   finding work.
   - PostgreSQL counted about 26,400 committed transactions per 8-worker
-    benchmark run (26,426 to 26,467, from `pg_stat_database.xact_commit`).
+    benchmark run (26,215 to 26,434, from `pg_stat_database.xact_commit`).
   - That is 2.2 per step, counting run creation and polling.
 - **WAL flushes.** Waiting for the WAL flush is part of the cost, but not
   most of it.
   - Three control runs added `&synchronous_commit=off` to the connection
     URL, so that commits stop waiting for the flush. They followed the same
     rules.
-  - With that setting, 8 workers reached 1,679.1 steps/s (median of 3; range
-    1,678.4 to 1,713.5).
-  - That is about 35% more than with the default setting.
+  - With that setting, 8 workers reached 1,665.7 steps/s (median of 3; range
+    1,645.6 to 1,784.1).
+  - That is about 23% more than with the default setting.
 
 ## Project layout
 

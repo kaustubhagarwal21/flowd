@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/kaustubhagarwal21/flowd/internal/store"
 	"github.com/kaustubhagarwal21/flowd/internal/store/pgstore"
 	"github.com/kaustubhagarwal21/flowd/internal/store/pgstore/pgtest"
@@ -382,4 +384,41 @@ func TestConcurrentOpen(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+// Starting flowd next to busy instances must not wait for their
+// transactions. Here another session holds the table lock that every UPDATE
+// of runs and steps takes. Re-running CREATE INDEX IF NOT EXISTS on an
+// existing schema would wait for that lock.
+func TestOpenDoesNotWaitForWriters(t *testing.T) {
+	t.Parallel()
+	url := pgtest.NewSchemaURL(t)
+	ctx := context.Background()
+	first, err := pgstore.Open(ctx, url)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer first.Close()
+
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) // runs before the schema is dropped, which would wait for it
+	if _, err := tx.Exec(ctx, `LOCK TABLE runs, steps IN ROW EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	openCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	second, err := pgstore.Open(openCtx, url)
+	if err != nil {
+		t.Fatalf("Open while another session is writing: %v", err)
+	}
+	second.Close()
 }

@@ -51,15 +51,31 @@ func Open(ctx context.Context, url string) (*Store, error) {
 	return &Store{pool: pool}, nil
 }
 
-// migrate applies the schema in one transaction. The schema is idempotent,
-// but CREATE TABLE IF NOT EXISTS is not safe against a concurrent CREATE of
-// the same table, so the advisory lock makes concurrent Opens take turns. The
+// migrate applies the schema in one transaction, unless it is already there.
+//
+// CREATE TABLE IF NOT EXISTS is not safe against a concurrent CREATE of the
+// same table, so the advisory lock makes concurrent Opens take turns. The
 // lock key includes the schema name, so Opens on different schemas (parallel
 // tests) do not wait for each other.
+//
+// An applied schema is left alone because CREATE INDEX IF NOT EXISTS locks
+// its table in SHARE mode even when the index exists. Re-running it while
+// other flowd instances are busy would block their writes, and could
+// deadlock with a CompleteStep that has updated steps and waits to update
+// runs.
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('flowd migrate ' || current_schema()))`); err != nil {
 			return err
+		}
+		// schema.sql is applied in one transaction, so if the last object
+		// it creates exists, all of them do. to_regclass takes no lock.
+		var applied bool
+		if err := tx.QueryRow(ctx, `SELECT to_regclass('steps_claim_idx') IS NOT NULL`).Scan(&applied); err != nil {
+			return err
+		}
+		if applied {
+			return nil
 		}
 		_, err := tx.Exec(ctx, schema)
 		return err

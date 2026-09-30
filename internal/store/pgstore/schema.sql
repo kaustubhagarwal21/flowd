@@ -1,5 +1,6 @@
--- flowd schema. Every statement is idempotent, so Open applies the whole
--- file on every start.
+-- flowd schema. Open applies this whole file, in one transaction, when the
+-- last object it creates (steps_claim_idx) does not exist yet. Keep that
+-- index last, and keep every statement idempotent.
 
 CREATE TABLE IF NOT EXISTS workflows (
     id          uuid        PRIMARY KEY DEFAULT gen_random_uuid(),

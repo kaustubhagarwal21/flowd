@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -223,9 +226,23 @@ func (b *lockedBuffer) String() string {
 }
 
 // TestEndToEnd runs the real flowd (PostgreSQL, engine, executors, API) and
-// drives a run through the HTTP API. It needs FLOWD_TEST_DATABASE_URL.
+// drives a run through the HTTP API: an http step that calls a test server,
+// then a noop step that depends on it. It needs FLOWD_TEST_DATABASE_URL.
 func TestEndToEnd(t *testing.T) {
 	dbURL := pgtest.NewSchemaURL(t) // skips when no test database is configured
+
+	// The target of the http step records every request it gets.
+	type request struct{ method, key, body string }
+	requests := make(chan request, 10)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- request{r.Method, r.Header.Get("Idempotency-Key"), string(body)}
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, `{"deployed":true}`)
+	}))
+	// Registered before flowd's own cleanup, so it runs after flowd stops.
+	t.Cleanup(target.Close)
+
 	ln := listen(t)
 	addr := ln.Addr().String()
 	ln.Close() // run listens on addr itself
@@ -240,6 +257,11 @@ func TestEndToEnd(t *testing.T) {
 		close(finished)
 	}()
 	t.Cleanup(func() {
+		// The HTTP client sometimes dials a spare connection that never
+		// carries a request, and Shutdown gives such a connection 5s before
+		// closing it. Closing the client's idle connections first keeps the
+		// test from waiting for that.
+		http.DefaultClient.CloseIdleConnections()
 		cancel()
 		<-finished
 		if runErr != nil {
@@ -272,9 +294,9 @@ func TestEndToEnd(t *testing.T) {
 	var wf struct {
 		ID string `json:"id"`
 	}
-	postJSON(t, base+"/v1/workflows", http.StatusCreated, `{"name":"e2e","steps":[
-		{"id":"first","type":"noop"},
-		{"id":"second","type":"noop","depends_on":["first"]}]}`, &wf)
+	postJSON(t, base+"/v1/workflows", http.StatusCreated, fmt.Sprintf(`{"name":"e2e","steps":[
+		{"id":"deploy","type":"http","http":{"method":"POST","url":%q,"body":{"version":"1.2.3"}}},
+		{"id":"notify","type":"noop","depends_on":["deploy"]}]}`, target.URL+"/deploy"), &wf)
 	var created struct {
 		RunID string `json:"run_id"`
 	}
@@ -283,6 +305,7 @@ func TestEndToEnd(t *testing.T) {
 	// Poll the run until it finishes.
 	var got store.Run
 	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		got = store.Run{}
 		getJSON(t, base+"/v1/runs/"+created.RunID, &got)
 		if got.Status.Finished() {
 			break
@@ -291,14 +314,35 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("run still %s after 15s: %+v", got.Status, got)
 		}
 	}
-	if got.Status != store.RunSucceeded || len(got.Steps) != 2 {
-		t.Fatalf("run finished as %+v, want succeeded with 2 steps", got)
+	if got.Status != store.RunSucceeded || len(got.Steps) != 2 || !sameJSON(got.Input, `{"from":"e2e"}`) {
+		t.Fatalf("run finished as %+v, want succeeded with 2 steps and its input", got)
 	}
 	for _, s := range got.Steps {
-		if s.Status != store.StepSucceeded {
-			t.Fatalf("step %s is %s, want succeeded", s.StepID, s.Status)
+		if s.Status != store.StepSucceeded || s.Attempt != 1 {
+			t.Fatalf("step %s is %s on attempt %d, want succeeded on attempt 1", s.StepID, s.Status, s.Attempt)
 		}
 	}
+	if out := got.Steps[0].Output; !sameJSON(out, `{"status":201,"body":{"deployed":true}}`) {
+		t.Errorf("deploy output = %s, want the target's status and body", out)
+	}
+
+	// The target was called once, with the step's body and the run's
+	// Idempotency-Key. It recorded the request before answering, so the
+	// request is already in the channel.
+	if n := len(requests); n != 1 {
+		t.Fatalf("target got %d requests, want 1", n)
+	}
+	req := <-requests
+	if req.method != http.MethodPost || req.key != created.RunID+"/deploy" || !sameJSON([]byte(req.body), `{"version":"1.2.3"}`) {
+		t.Errorf("target got %+v, want a POST of the step body with Idempotency-Key %s/deploy", req, created.RunID)
+	}
+}
+
+// sameJSON reports whether got holds the same JSON value as want. PostgreSQL
+// stores JSON as jsonb, which may change whitespace and key order.
+func sameJSON(got []byte, want string) bool {
+	var g, w any
+	return json.Unmarshal(got, &g) == nil && json.Unmarshal([]byte(want), &w) == nil && reflect.DeepEqual(g, w)
 }
 
 func postJSON(t *testing.T, url string, wantStatus int, body string, v any) {

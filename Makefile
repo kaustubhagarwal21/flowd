@@ -15,7 +15,12 @@ test:
 race:
 	go test -race -count=1 ./...
 
+# The gofmt check is the same as CI's, so that code passing make lint also
+# passes CI. gofmt -l exits 0 even when it lists files, so the list itself
+# is tested.
 lint:
+	@unformatted="$$(gofmt -l .)"; \
+	if [ -n "$$unformatted" ]; then echo "These files need gofmt:"; echo "$$unformatted"; exit 1; fi
 	go vet ./...
 	go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 

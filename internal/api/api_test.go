@@ -192,6 +192,85 @@ func TestCreateWorkflowValidationError(t *testing.T) {
 	}
 }
 
+// latin1 is "café" in Latin-1: the 0xe9 byte is not valid UTF-8. Go's JSON
+// parser accepts it inside a string; PostgreSQL's jsonb does not.
+const latin1 = "caf\xe9"
+
+// unstorableWorkflows are valid workflow bodies (Go accepts them) with a
+// string that jsonb cannot store. Each must give 400, not a 500 from the
+// database.
+var unstorableWorkflows = []struct{ name, body string }{
+	{"NUL escape in the name", `{"name":"x\u0000","steps":[{"id":"a","type":"noop"}]}`},
+	{"NUL escape in a header value", `{"name":"x","steps":[{"id":"a","type":"http",
+		"http":{"method":"GET","url":"http://example.com","headers":{"X-Token":"\u0000"}}}]}`},
+	{"lone surrogate in the http body", `{"name":"x","steps":[{"id":"a","type":"http",
+		"http":{"method":"POST","url":"http://example.com","body":{"k":"\ud800"}}}]}`},
+	{"invalid UTF-8 in the http body", `{"name":"x","steps":[{"id":"a","type":"http",
+		"http":{"method":"POST","url":"http://example.com","body":{"k":"` + latin1 + `"}}}]}`},
+	{"invalid UTF-8 in the name", `{"name":"` + latin1 + `","steps":[{"id":"a","type":"noop"}]}`},
+}
+
+// unstorableRuns are run bodies with an input that jsonb cannot store.
+var unstorableRuns = []struct{ name, body string }{
+	{"NUL escape in the input", `{"input":{"k":"\u0000"}}`},
+	{"lone surrogate in the input", `{"input":{"k":"\ud800"}}`},
+	{"high surrogate without its low half", `{"input":{"k":"\ud83dx"}}`},
+	{"invalid UTF-8 in the input", `{"input":{"k":"` + latin1 + `"}}`},
+	{"invalid UTF-8 in an input key", `{"input":{"` + latin1 + `":1}}`},
+}
+
+func TestCreateWorkflowRejectsUnstorableJSON(t *testing.T) {
+	for _, tc := range unstorableWorkflows {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newHarness()
+			p := wantProblem(t, do(t, a.handler, "POST", "/v1/workflows", jsonType, tc.body), http.StatusBadRequest)
+			if !strings.Contains(p.Detail, "cannot be stored") || !strings.Contains(p.Detail, `\u0000`) {
+				t.Errorf("detail %q does not explain what cannot be stored", p.Detail)
+			}
+			if n := a.store.workflowCount(); n != 0 {
+				t.Errorf("a workflow was stored (%d workflows)", n)
+			}
+		})
+	}
+}
+
+func TestCreateRunRejectsUnstorableInput(t *testing.T) {
+	for _, tc := range unstorableRuns {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newHarness()
+			wf := a.store.addWorkflow(demoDefinition())
+			p := wantProblem(t, do(t, a.handler, "POST", "/v1/workflows/"+wf.ID+"/runs", jsonType, tc.body), http.StatusBadRequest)
+			if !strings.Contains(p.Detail, "cannot be stored") {
+				t.Errorf("detail %q does not explain what cannot be stored", p.Detail)
+			}
+			if runs, _, _ := a.store.ListRuns(context.Background(), store.ListRunsFilter{}); len(runs) != 0 {
+				t.Errorf("a run was created: %+v", runs)
+			}
+			if n := a.waker.n.Load(); n != 0 {
+				t.Errorf("engine woken %d times for a rejected request", n)
+			}
+		})
+	}
+}
+
+// The storability check must not turn away JSON that PostgreSQL can store:
+// escaped and raw non-ASCII text, a surrogate pair, and a backslash before
+// "u0000" (an escaped backslash, not a NUL escape).
+func TestStorableUnicodeIsAccepted(t *testing.T) {
+	a := newHarness()
+	wf := `{"name":"café ✓ 😀","steps":[{"id":"a","type":"http",
+		"http":{"method":"POST","url":"http://example.com","headers":{"X-Note":"café"},
+		"body":{"k":"\\u0000 😀 ✓"}}}]}`
+	var got store.Workflow
+	wantJSON(t, do(t, a.handler, "POST", "/v1/workflows", jsonType, wf), http.StatusCreated, &got)
+	if want := "café ✓ \U0001F600"; got.Name != want {
+		t.Errorf("name = %q, want %q", got.Name, want)
+	}
+
+	rec := do(t, a.handler, "POST", "/v1/workflows/"+got.ID+"/runs", jsonType, `{"input":{"k":"\\u0000 😀 ✓"}}`)
+	wantJSON(t, rec, http.StatusAccepted, &map[string]string{})
+}
+
 func TestCreateWorkflowRejectsBadRequests(t *testing.T) {
 	big := `{"name":"` + strings.Repeat("a", 1<<20) + `","steps":[]}`
 	cases := []struct {
@@ -288,6 +367,49 @@ func TestCreateRun(t *testing.T) {
 	rec := do(t, a.handler, "GET", "/metrics", "", "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "flowd_runs_started_total 5") {
 		t.Fatalf("GET /metrics: status %d, body does not count 5 started runs", rec.Code)
+	}
+}
+
+// A chunked body has no Content-Length (ContentLength is -1), even when it is
+// empty. An empty one must still mean "no input", with or without a
+// Content-Type, and a non-empty one must be read in full.
+func TestCreateRunChunkedBody(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+		wantInput   string // as stored; "" means no input
+	}{
+		{"empty, no content type", "", "", ""},
+		{"empty, JSON content type", jsonType, "", ""},
+		{"with input", jsonType, `{"input":{"env":"prod"}}`, `{"env":"prod"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newHarness()
+			wf := a.store.addWorkflow(demoDefinition())
+			// Hiding the strings.Reader keeps httptest from setting ContentLength.
+			req := httptest.NewRequest("POST", "/v1/workflows/"+wf.ID+"/runs", struct{ io.Reader }{strings.NewReader(tc.body)})
+			req.TransferEncoding = []string{"chunked"}
+			if req.ContentLength != -1 {
+				t.Fatalf("ContentLength = %d, want -1 as for a chunked body", req.ContentLength)
+			}
+			if tc.contentType != "" {
+				req.Header.Set("Content-Type", tc.contentType)
+			}
+			rec := httptest.NewRecorder()
+			a.handler.ServeHTTP(rec, req)
+
+			var resp map[string]string
+			wantJSON(t, rec, http.StatusAccepted, &resp)
+			run, err := a.store.GetRun(context.Background(), resp["run_id"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(run.Input) != tc.wantInput {
+				t.Fatalf("stored input %q, want %q", run.Input, tc.wantInput)
+			}
+		})
 	}
 }
 

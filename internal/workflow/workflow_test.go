@@ -3,6 +3,8 @@ package workflow
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,6 +18,13 @@ func noop(id string, deps ...string) Step {
 
 func httpStep(id, method, rawURL string) Step {
 	return Step{ID: id, Type: StepHTTP, HTTP: &HTTPSpec{Method: method, URL: rawURL}}
+}
+
+// withHeaders returns an http step that sends the given headers.
+func withHeaders(headers map[string]string) Step {
+	s := httpStep("call", "GET", "http://example.com")
+	s.HTTP.Headers = headers
+	return s
 }
 
 // manySteps returns n independent noop steps named s0, s1, ...
@@ -143,6 +152,52 @@ func TestValidateHTTP(t *testing.T) {
 	}
 }
 
+// The header rules must match Go's http client exactly: rejecting a header
+// the client would send breaks working workflows, and accepting one it
+// refuses gives a step that can never succeed. Each case goes through both.
+func TestHeaderRulesMatchGoClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(srv.Close)
+
+	cases := []struct{ name, value string }{
+		{"X-Api-Key", "k-123"},
+		{"x-lower-case", "v"},
+		{"X-Every_Token.Char!#$%&'*+^`|~9", "v"},
+		{"X-Tab", "a\tb"},
+		{"X-Spaces", " a b "},
+		{"X-Empty", ""},
+		{"X-Non-ASCII-Value", "café ✓"},
+		{"Bad Header", "v"},
+		{"X-A:B", "v"},
+		{"X-A\r\nX-B", "v"},
+		{"X-Café", "v"},
+		{"", "v"},
+		{"X-(Paren)", "v"},
+		{"X-CR", "a\rb"},
+		{"X-LF", "a\nb"},
+		{"X-NUL", "a\x00b"},
+		{"X-Ctrl", "a\x01b"},
+		{"X-DEL", "a\x7fb"},
+	}
+	for _, tc := range cases {
+		_, verr := Validate(&Definition{Steps: []Step{withHeaders(map[string]string{tc.name: tc.value})}})
+
+		// Set the header the way the http executor does.
+		req, err := http.NewRequest("GET", srv.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set(tc.name, tc.value)
+		resp, cerr := srv.Client().Do(req)
+		if cerr == nil {
+			resp.Body.Close()
+		}
+		if (verr == nil) != (cerr == nil) {
+			t.Errorf("header %q: %q: Validate error = %v, but Go's client error = %v", tc.name, tc.value, verr, cerr)
+		}
+	}
+}
+
 func TestValidateErrors(t *testing.T) {
 	tooManyDeps := manySteps(MaxDependsOn + 2)
 	for i := 1; i < len(tooManyDeps); i++ {
@@ -177,6 +232,25 @@ func TestValidateErrors(t *testing.T) {
 		{"ftp url", []Step{httpStep("a", "GET", "ftp://example.com/f")}, "steps[0].http.url", "not an absolute"},
 		{"url without host", []Step{httpStep("a", "GET", "http://:8080/x")}, "steps[0].http.url", "not an absolute"},
 		{"unparsable url", []Step{httpStep("a", "GET", "http://[::1")}, "steps[0].http.url", "not an absolute"},
+
+		// Go's http client refuses these headers, so no attempt could ever
+		// reach the target. The message names the header.
+		{"header name with a space", []Step{withHeaders(map[string]string{"Bad Header": "v"})}, "steps[0].http.headers", `header name "Bad Header" is not a valid HTTP token`},
+		{"header name with a colon", []Step{withHeaders(map[string]string{"X-A:B": "v"})}, "steps[0].http.headers", `"X-A:B"`},
+		{"header name with CRLF", []Step{withHeaders(map[string]string{"X-A\r\nX-B": "v"})}, "steps[0].http.headers", `"X-A\r\nX-B"`},
+		{"non-ASCII header name", []Step{withHeaders(map[string]string{"X-Café": "v"})}, "steps[0].http.headers", `"X-Café"`},
+		{"empty header name", []Step{withHeaders(map[string]string{"": "v"})}, "steps[0].http.headers", `header name "" is not`},
+		{"header value with CR", []Step{withHeaders(map[string]string{"X-Token": "a\rb"})}, "steps[0].http.headers", `header "X-Token" contains a control character`},
+		{"header value with LF", []Step{withHeaders(map[string]string{"X-Token": "a\nX-Injected: 1"})}, "steps[0].http.headers", `header "X-Token" contains a control character`},
+		{"header value with NUL", []Step{withHeaders(map[string]string{"X-Token": "a\x00b"})}, "steps[0].http.headers", `header "X-Token" contains a control character`},
+		{"header value with DEL", []Step{withHeaders(map[string]string{"X-Token": "a\x7fb"})}, "steps[0].http.headers", `header "X-Token"`},
+		{
+			// With several bad headers the first in sorted order is named,
+			// so the error does not depend on map iteration order.
+			"first bad header in sorted order",
+			[]Step{withHeaders(map[string]string{"Z Bad": "v", "A Bad": "v", "M-Bad": "\n"})},
+			"steps[0].http.headers", `"A Bad"`,
+		},
 
 		{"negative sleep", []Step{{ID: "a", Type: StepNoop, Noop: &NoopSpec{SleepMS: -1}}}, "steps[0].noop.sleep_ms", "between 0 and"},
 		{"sleep above max timeout", []Step{{ID: "a", Type: StepNoop, Noop: &NoopSpec{SleepMS: int(MaxTimeout.Milliseconds()) + 1}}}, "steps[0].noop.sleep_ms", "between 0 and"},

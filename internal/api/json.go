@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,16 +10,25 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+
+	"github.com/kaustubhagarwal21/flowd/internal/jsonb"
 )
 
 // maxBodyBytes caps request bodies. A workflow at the 100-step limit fits
 // easily; the cap stops a client from making the server buffer a huge body.
 const maxBodyBytes = 1 << 20 // 1 MiB
 
+// unstorableDetail is the 400 detail for a body that PostgreSQL's jsonb
+// would reject although Go's JSON parser accepts it. It lists the rules so
+// that the client can find the offending string without guessing.
+const unstorableDetail = `request body cannot be stored: JSON strings must be valid UTF-8 ` +
+	`and must not contain the \u0000 escape or an unpaired surrogate escape such as \ud800`
+
 // readJSON decodes the request body into dst. It enforces, in order, the
-// JSON content type (415), the size cap (413), and exactly one well-formed
-// JSON value without unknown fields (400). On failure it has already written
-// the problem response and returns false.
+// JSON content type (415), the size cap (413), exactly one well-formed JSON
+// value without unknown fields (400), and that PostgreSQL can store the body
+// as jsonb (400). On failure it has already written the problem response and
+// returns false.
 func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
@@ -25,18 +36,20 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-	// Rejecting unknown fields turns a typo such as "depends_no" into a clear
-	// 400 instead of a setting that is silently ignored.
-	dec.DisallowUnknownFields()
-	err = dec.Decode(dst)
+	// The raw bytes are kept for the jsonb check. The decoded values cannot
+	// be checked instead: a string field keeps a \u0000 escape as a NUL, and
+	// a json.RawMessage field (http.body, input) keeps every byte as sent.
+	// Either would otherwise fail inside the database, as a 500.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err == nil {
-		// Anything after the first value, such as "{} {}", is a client bug.
-		if err = dec.Decode(&json.RawMessage{}); err == nil {
-			err = errors.New("body must contain a single JSON value")
-		} else if errors.Is(err, io.EOF) {
+		err = decodeStrict(body, dst)
+	}
+	if err == nil {
+		if jsonb.Storable(body) {
 			return true
 		}
+		writeProblem(w, r, http.StatusBadRequest, unstorableDetail)
+		return false
 	}
 
 	var tooLarge *http.MaxBytesError
@@ -50,6 +63,45 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		writeProblem(w, r, http.StatusBadRequest, "invalid JSON body: "+strings.TrimPrefix(err.Error(), "json: "))
 	}
 	return false
+}
+
+// decodeStrict decodes body, which must hold exactly one JSON value, into dst.
+func decodeStrict(body []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	// Rejecting unknown fields turns a typo such as "depends_no" into a clear
+	// 400 instead of a setting that is silently ignored.
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	// Anything after the first value, such as "{} {}", is a client bug.
+	switch err := dec.Decode(&json.RawMessage{}); {
+	case err == nil:
+		return errors.New("body must contain a single JSON value")
+	case errors.Is(err, io.EOF):
+		return nil
+	default:
+		return err
+	}
+}
+
+// hasBody reports whether r has a body with at least one byte. It finds out
+// by reading, because Content-Length cannot tell: it is -1 for a chunked
+// body, even an empty one. The byte it reads is put back, in a buffered
+// r.Body.
+func hasBody(r *http.Request) (bool, error) {
+	br := bufio.NewReader(r.Body)
+	switch _, err := br.Peek(1); {
+	case errors.Is(err, io.EOF):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{br, r.Body}
+	return true, nil
 }
 
 // writeJSON sends v as JSON. It encodes before writing the status line, so

@@ -25,6 +25,8 @@ const pingTimeout = 2 * time.Second
 
 func (s *server) createWorkflow(w http.ResponseWriter, r *http.Request) {
 	var def workflow.Definition
+	// readJSON also rejects a body that jsonb cannot store, so every string
+	// of the definition, including http.body, is safe to store.
 	if !readJSON(w, r, &def) {
 		return
 	}
@@ -74,8 +76,16 @@ type createRunResponse struct {
 
 func (s *server) createRun(w http.ResponseWriter, r *http.Request) {
 	var req createRunRequest
-	// The body is optional because a run does not need input.
-	if r.ContentLength != 0 && !readJSON(w, r, &req) {
+	// The body is optional because a run does not need input. An empty body
+	// means no input however it is framed, including an empty chunked body.
+	present, err := hasBody(r)
+	if err != nil {
+		writeProblem(w, r, http.StatusBadRequest, "could not read the request body")
+		return
+	}
+	// readJSON also rejects a body that jsonb cannot store. The input is part
+	// of the body, so this covers the input too, before it reaches CreateRun.
+	if present && !readJSON(w, r, &req) {
 		return
 	}
 	input := req.Input

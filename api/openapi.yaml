@@ -9,6 +9,9 @@ info:
     - Request bodies must be JSON sent with `Content-Type: application/json`
       (otherwise 415), at most 1 MiB (otherwise 413), and hold exactly one
       JSON value with no unknown fields (otherwise 400).
+    - Strings in a request body must be valid UTF-8 and must not contain the
+      `\u0000` escape or an unpaired surrogate escape such as `\ud800`
+      (otherwise 400). PostgreSQL's jsonb type cannot store them.
     - Every error is an RFC 7807 problem with `Content-Type: application/problem+json`.
       This includes 404 for unknown paths and 405 (with an `Allow` header)
       for unsupported methods.
@@ -62,9 +65,10 @@ paths:
                 $ref: '#/components/schemas/Workflow'
         '400':
           description: |
-            The body is not valid JSON, has unknown fields, or the definition
-            fails validation. A validation problem carries a `field` member
-            naming the invalid part, e.g. `steps[1].depends_on`.
+            The body is not valid JSON, has unknown fields, has a string that
+            PostgreSQL cannot store (see the conventions above), or the
+            definition fails validation. A validation problem carries a
+            `field` member naming the invalid part, e.g. `steps[1].depends_on`.
           content:
             application/problem+json:
               schema:
@@ -106,9 +110,12 @@ paths:
       operationId: createRun
       summary: Start a run of a workflow
       description: |
-        The body is optional. The run is queued and the engine executes it in
-        the background, so the answer is 202 with the new run's ID; poll
-        `GET /v1/runs/{id}` (the `Location` header) for progress.
+        The body is optional. An empty body means no input however it is
+        framed (no body, `Content-Length: 0`, or an empty chunked body), and
+        then needs no `Content-Type`. The run is queued and the engine
+        executes it in the background, so the answer is 202 with the new
+        run's ID; poll `GET /v1/runs/{id}` (the `Location` header) for
+        progress.
       parameters:
         - $ref: '#/components/parameters/WorkflowID'
       requestBody:
@@ -401,6 +408,16 @@ components:
         Settings of an `http` step. Any 2xx answer is success. Every attempt
         sends `Idempotency-Key: <run_id>/<step_id>`, which stays the same
         across retries.
+
+        The client follows up to 10 redirects, including redirects to other
+        hosts, and sends the custom headers and the `Idempotency-Key` to each
+        new location. Go's client withholds credential headers such as
+        `Authorization` and `Cookie` when a redirect leaves the original
+        domain. A final 2xx body becomes the step's output, and the start of
+        any other body goes into its `last_error`; `GET /v1/runs/{id}`
+        returns both. flowd does not restrict targets, so anyone who can
+        create workflows can make it call, and read, internal addresses. A
+        restriction on targets must also cover redirects.
       required: [method, url]
       additionalProperties: false
       properties:
@@ -414,6 +431,11 @@ components:
           example: http://build.internal/start
         headers:
           type: object
+          description: |
+            Extra request headers. Names must be HTTP tokens, and values must
+            not contain control characters other than tab (such as CR, LF or
+            NUL), because Go's HTTP client refuses to send them. A violation
+            is a 400 whose detail names the header.
           additionalProperties:
             type: string
         body:
@@ -487,8 +509,15 @@ components:
       type: string
       description: |
         pending waits for its dependencies; ready can be claimed; running is
-        leased by a worker; succeeded, failed, skipped (an upstream step
-        failed) and cancelled are final.
+        leased by a worker; succeeded, failed, skipped and cancelled are
+        final.
+
+        skipped means the step will not run, or run again, because its run
+        failed first. Runs are fail-fast: when one step fails for good, the
+        run fails at once and every step that is still pending or ready is
+        skipped. That includes steps that do not depend on the failed step
+        and steps waiting for a retry. Steps that are already running are
+        not stopped, and their results are recorded.
       enum: [pending, ready, running, succeeded, failed, skipped, cancelled]
     Run:
       type: object
@@ -539,8 +568,11 @@ components:
           description: |
             What the step produced. An http step gives
             `{"status": <code>, "body": <the response body>}`, where the body
-            (at most 16 KiB) is embedded as JSON when it is valid JSON and as
-            a string otherwise.
+            (at most 16 KiB) is embedded as JSON when PostgreSQL can store it
+            as JSON, and as a string otherwise. Output that PostgreSQL cannot
+            store as JSON (invalid UTF-8, the `\u0000` escape, or an unpaired
+            surrogate escape such as `\ud800`) is kept as a JSON string, with
+            NUL bytes dropped and invalid UTF-8 replaced by U+FFFD.
         started_at:
           type: string
           format: date-time

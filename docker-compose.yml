@@ -9,7 +9,10 @@ services:
       POSTGRES_PASSWORD: flowd
       POSTGRES_DB: flowd
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U flowd -d flowd"]
+      # -h probes over TCP, the way flowd connects. On the first start the
+      # image runs a temporary init server that listens on the Unix socket
+      # only, so a socket probe can pass while TCP is still refused.
+      test: ["CMD-SHELL", "pg_isready -h localhost -U flowd"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -18,6 +21,10 @@ services:
 
   flowd:
     build: .
+    # flowd exits when it cannot reach PostgreSQL at startup; it does not
+    # retry. Restarting it covers a database that is not reachable yet, and
+    # any later crash.
+    restart: on-failure
     depends_on:
       # Start flowd only once PostgreSQL accepts connections.
       postgres:

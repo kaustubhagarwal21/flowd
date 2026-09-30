@@ -4,6 +4,7 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/url"
 	"regexp"
 	"slices"
@@ -226,7 +227,50 @@ func checkHTTP(field func(string) string, id string, h *HTTPSpec) error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return invalid(field("http.url"), "step %q: %q is not an absolute http or https URL", id, h.URL)
 	}
+	// Go's http client refuses to send a header it considers invalid, and
+	// every attempt would then fail the same way without reaching the
+	// target. Rejecting the header here gives one clear 400 instead of a
+	// step that is retried until its attempts run out. Sorted, so that the
+	// same definition always reports the same header.
+	for _, name := range slices.Sorted(maps.Keys(h.Headers)) {
+		if !validHeaderName(name) {
+			return invalid(field("http.headers"), "step %q: header name %q is not a valid HTTP token", id, name)
+		}
+		// The value is left out of the message: it may be a secret.
+		if !validHeaderValue(h.Headers[name]) {
+			return invalid(field("http.headers"), "step %q: the value of header %q contains a control character "+
+				"(CR, LF, NUL and the other control characters except tab are not allowed)", id, name)
+		}
+	}
 	return nil
+}
+
+// validHeaderName reports whether name is an HTTP token (RFC 9110, section
+// 5.6.2), the rule Go's http client applies to header names.
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		isAlnum := 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9'
+		if !isAlnum && !strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
+			return false
+		}
+	}
+	return true
+}
+
+// validHeaderValue reports whether Go's http client accepts value: it
+// refuses every ASCII control character except horizontal tab. CR and LF
+// would otherwise let a value inject extra headers.
+func validHeaderValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; (c < ' ' && c != '\t') || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // checkDeps validates the depends_on list of step i.

@@ -23,8 +23,10 @@ lint:
 run: build
 	./bin/flowd
 
+# Needs FLOWD_DATABASE_URL. The benchmark works in a temporary schema that it
+# drops at exit. Pass flags with BENCH_FLAGS, e.g. BENCH_FLAGS="-runs 500".
 bench:
-	go test -run='^$$' -bench=. -benchmem ./...
+	go run ./cmd/flowd-bench $(BENCH_FLAGS)
 
 docker:
 	docker build --build-arg VERSION=$(VERSION) -t flowd:$(VERSION) .

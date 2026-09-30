@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/kaustubhagarwal21/flowd/internal/engine"
+	"github.com/kaustubhagarwal21/flowd/internal/metrics"
 	"github.com/kaustubhagarwal21/flowd/internal/store"
 	"github.com/kaustubhagarwal21/flowd/internal/store/pgstore"
 	"github.com/kaustubhagarwal21/flowd/internal/store/pgstore/pgtest"
@@ -189,6 +190,73 @@ func TestBinaryResponseIsSaved(t *testing.T) {
 		}
 		if err := json.Unmarshal(s.Output, &out); err != nil || out.Status != 200 || out.Body != "GIF\x01 image" {
 			t.Errorf("output = %s (%v), want status 200 and the body without NUL bytes", s.Output, err)
+		}
+	})
+}
+
+// A 2xx body that json.Valid accepts but jsonb does not must be saved on the
+// first attempt. Otherwise every save fails, and a target that succeeded is
+// called again each lease until the step runs out of attempts.
+func TestUnstorableJSONResponseIsSaved(t *testing.T) {
+	bodies := map[string]string{
+		"NUL escape":                `{"x":"\u0000"}`,
+		"lone surrogate escape":     `{"x":"\ud800"}`,
+		"invalid UTF-8 in a string": "{\"x\":\"caf\xe9\"}",
+	}
+	forEachStore(t, func(t *testing.T, st store.Store, _ func() store.Store) {
+		for name, body := range bodies {
+			t.Run(name, func(t *testing.T) {
+				var calls atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					io.WriteString(w, body)
+				}))
+				t.Cleanup(srv.Close)
+				call := httpStep("call", srv.URL)
+				call.Retry.MaxAttempts = 2
+				run := createRun(t, st, "unstorable", call)
+				// A short lease, so a result that cannot be saved fails fast.
+				startEngine(t, st, engine.Config{Workers: 1, Lease: 500 * time.Millisecond, Poll: fast}, realExecutors(), nil)
+
+				run = waitRunFinished(t, st, run.ID, 20*time.Second)
+				if s := stepOf(t, run, "call"); run.Status != store.RunSucceeded || s.Attempt != 1 {
+					t.Errorf("run %s, step %s on attempt %d (%q); want succeeded on attempt 1", run.Status, s.Status, s.Attempt, s.LastError)
+				}
+				if n := calls.Load(); n != 1 {
+					t.Errorf("target called %d times, want 1", n)
+				}
+			})
+		}
+	})
+}
+
+// A cancel that lands after a step finished but before its result is saved
+// is not a lost worker. pgstore reports it to CompleteStep as a lost lease
+// (CancelRun takes running steps away too), but alerts on result="lost" are
+// meant for crashed or cut-off workers, not for users cancelling runs.
+func TestCancelBeforeSaveIsNotCountedAsLost(t *testing.T) {
+	forEachStore(t, func(t *testing.T, st store.Store, _ func() store.Store) {
+		run := createRun(t, st, "cancel-before-save", noopStep("a"))
+		execs := map[workflow.StepType]engine.Executor{
+			workflow.StepNoop: funcExecutor(func(ctx context.Context, c *store.Claim) (json.RawMessage, error) {
+				// The work is done; the user cancels before the engine saves it.
+				if _, err := st.CancelRun(context.Background(), c.RunID); err != nil {
+					return nil, err
+				}
+				return json.RawMessage(`{"done":true}`), nil
+			}),
+		}
+		m := metrics.New()
+		_, stop := startEngine(t, st, engine.Config{Workers: 1, Poll: fast}, execs, m)
+		waitFor(t, 20*time.Second, "the attempt to be counted", func() bool {
+			return hasMetric(m, `flowd_steps_executed_total{`)
+		})
+		stop() // so every metric has been recorded
+		if got, err := st.GetRun(context.Background(), run.ID); err != nil || got.Status != store.RunCancelled {
+			t.Fatalf("run = %s (%v), want cancelled", got.Status, err)
+		}
+		if hasMetric(m, `flowd_steps_executed_total{result="lost"`) {
+			t.Errorf("the attempt was counted as lost, want cancelled (or success, if the store saved it)")
 		}
 	})
 }
@@ -413,6 +481,17 @@ func TestThreeEnginesRunEveryStepExactlyOnce(t *testing.T) {
 		}
 		if len(executed) != runs*len(steps) {
 			t.Errorf("%d distinct steps executed, want %d", len(executed), runs*len(steps))
+		}
+		// Exactly-once proves little if a single engine did all the work, so
+		// check that the instances really competed for the same steps.
+		busy := 0
+		for _, n := range perEngine {
+			if n > 0 {
+				busy++
+			}
+		}
+		if busy < 2 {
+			t.Errorf("steps executed per engine: %v; want at least 2 of the %d engines to share the work", perEngine, engines)
 		}
 		t.Logf("steps executed per engine: %v", perEngine)
 	})

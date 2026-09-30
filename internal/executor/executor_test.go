@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/kaustubhagarwal21/flowd/internal/engine"
 	"github.com/kaustubhagarwal21/flowd/internal/executor"
+	"github.com/kaustubhagarwal21/flowd/internal/jsonb"
 	"github.com/kaustubhagarwal21/flowd/internal/store"
 	"github.com/kaustubhagarwal21/flowd/internal/workflow"
 )
@@ -170,6 +172,44 @@ func TestHTTPOutputHasNoNULCharacters(t *testing.T) {
 			var got struct{ Body string }
 			if err := json.Unmarshal(out, &got); err != nil || got.Body != tt.want {
 				t.Errorf("body = %q (%v), want %q", got.Body, err, tt.want)
+			}
+		})
+	}
+}
+
+// jsonb rejects some JSON that json.Valid accepts. The output must be
+// storable whatever the body, or saving the step would fail on every attempt
+// and a target that succeeded would be called again and again.
+func TestHTTPOutputIsAlwaysStorable(t *testing.T) {
+	tests := []struct {
+		name, body string
+		want       any // the body, as decoded from the output
+	}{
+		// Unstorable JSON is kept as text, where escapes are plain characters.
+		{"NUL escape", `{"a":"x\u0000y"}`, `{"a":"x\u0000y"}`},
+		{"lone surrogate escape", `{"a":"\ud800"}`, `{"a":"\ud800"}`},
+		{"invalid UTF-8 in a string", "{\"a\":\"caf\xe9\"}", "{\"a\":\"caf\U0000FFFD\"}"},
+		{"invalid UTF-8 and NUL in text", "caf\xe9\x00!", "caf\U0000FFFD!"},
+		// Storable JSON is still kept as JSON. \x5c is a backslash, so the
+		// body holds the escaped surrogate pair of U+1F600.
+		{"surrogate pair", "{\"a\":\"\x5cud83d\x5cude00\"}", map[string]any{"a": "\U0001F600"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, _ := newServer(t, http.StatusOK, tt.body)
+			out, err := executor.NewHTTP(nil).Execute(context.Background(), httpClaim(srv.URL, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !jsonb.Storable(out) {
+				t.Errorf("output %q cannot be stored in jsonb", out)
+			}
+			var got struct {
+				Status int `json:"status"`
+				Body   any `json:"body"`
+			}
+			if err := json.Unmarshal(out, &got); err != nil || got.Status != 200 || !reflect.DeepEqual(got.Body, tt.want) {
+				t.Errorf("output = %q (%v), want status 200 and body %#v", out, err, tt.want)
 			}
 		})
 	}

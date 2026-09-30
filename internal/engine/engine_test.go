@@ -261,6 +261,61 @@ func TestHeartbeatStopsAbandonedStep(t *testing.T) {
 	}
 }
 
+// A worker cut off from the store gets heartbeat errors that are not a lease
+// loss: calls fail (connection refused) or never answer. Once its lease has
+// run out, another instance may re-claim the step and run it at the same
+// time, so the worker must stop the step by then and discard its result, as
+// for a lost lease.
+func TestStepStopsWhenLeaseRunsOutUnrenewed(t *testing.T) {
+	faults := map[string]func(ctx context.Context) error{
+		"heartbeat fails": func(ctx context.Context) error {
+			return errors.New("fake: connection refused")
+		},
+		"heartbeat hangs": func(ctx context.Context) error {
+			<-ctx.Done() // never answers; only the caller can give up
+			return ctx.Err()
+		},
+	}
+	for name, fault := range faults {
+		t.Run(name, func(t *testing.T) {
+			st := newFakeStore()
+			st.breakHeartbeats(fault)
+			a := newStep("a", testStepType)
+			a.Retry.MaxAttempts = 1 // no second attempt once the lease expires
+			run := createRun(t, st, "cut-off", a)
+			started, causes := make(chan struct{}, 1), make(chan error, 1)
+			execs := map[workflow.StepType]engine.Executor{testStepType: blockingExecutor(started, causes)}
+			m := metrics.New()
+			const lease = 300 * time.Millisecond // a heartbeat every 100ms
+			_, stop := startEngine(t, st, engine.Config{Workers: 1, Lease: lease, Poll: fast}, execs, m)
+
+			receive(t, started, 5*time.Second, "the step to start")
+			begin := time.Now()
+			// The step's own timeout is 10s: only the lease can stop it this early.
+			cause := receive(t, causes, 5*time.Second, "the step to be cancelled")
+			took := time.Since(begin)
+			if !errors.Is(cause, store.ErrLeaseLost) {
+				t.Errorf("step context cause = %v, want a lease loss", cause)
+			}
+			// The lease was taken just before the step started. A failed
+			// heartbeat (every 100ms) is no reason to stop before it runs out.
+			if took < lease*2/3 || took > lease+lease/2 {
+				t.Errorf("step stopped %v after it started, want about the %v lease", took, lease)
+			}
+			// Once the lease has expired, the store fails the step: it has no
+			// attempts left.
+			if run = waitRunFinished(t, st, run.ID, 5*time.Second); run.Status != store.RunFailed {
+				t.Errorf("run status = %s, want failed", run.Status)
+			}
+			stop()
+			if w := st.writeLog(); len(w) != 0 {
+				t.Errorf("engine wrote %+v after its lease ran out, want no writes", w)
+			}
+			wantMetric(t, m, `flowd_steps_executed_total{result="lost",type="test"} 1`)
+		})
+	}
+}
+
 func TestShutdownLetsInFlightStepsFinish(t *testing.T) {
 	st := newFakeStore()
 	run := createRun(t, st, "drain", newStep("a", testStepType), newStep("b", testStepType, "a"))

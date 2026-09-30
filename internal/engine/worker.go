@@ -16,6 +16,13 @@ import (
 // maxErrorBackoff caps how long a worker waits after consecutive store errors.
 const maxErrorBackoff = 5 * time.Second
 
+// errLeaseExpired is the cancellation cause of a step whose lease ran out
+// before a heartbeat could renew it, for example while the database was
+// unreachable. It wraps store.ErrLeaseLost because the consequence is the
+// same: another instance may already have re-claimed the step, so it must
+// stop and its result must be discarded.
+var errLeaseExpired = fmt.Errorf("lease ran out before a heartbeat could renew it: %w", store.ErrLeaseLost)
+
 // Step results, used as the "result" label of flowd_steps_executed_total.
 const (
 	resultSuccess   = "success"   // completed
@@ -31,6 +38,10 @@ const (
 func (e *Engine) work(ctx, stepsCtx context.Context) {
 	storeErrors := 0 // consecutive failed claims, for the backoff
 	for ctx.Err() == nil {
+		// Read the clock before claiming: the store starts the lease while
+		// handling the call, so the lease cannot run out before
+		// claimedAt+Lease, whatever the database server's clock says.
+		claimedAt := time.Now()
 		c, err := e.store.ClaimStep(stepsCtx, e.cfg.Owner, e.cfg.Lease)
 		switch {
 		case err != nil:
@@ -51,7 +62,7 @@ func (e *Engine) work(ctx, stepsCtx context.Context) {
 			// There may be more runnable steps (a fan-out, a burst of new
 			// runs): let one more idle worker look instead of waiting a poll.
 			e.Wake()
-			e.runStep(stepsCtx, c)
+			e.runStep(stepsCtx, c, claimedAt.Add(e.cfg.Lease))
 		}
 	}
 }
@@ -80,18 +91,20 @@ func sleep(ctx context.Context, d time.Duration) {
 }
 
 // runStep executes one claimed step and records its outcome in the store.
-func (e *Engine) runStep(stepsCtx context.Context, c *store.Claim) {
+// leaseUntil is when the claim's lease runs out, on the local clock.
+func (e *Engine) runStep(stepsCtx context.Context, c *store.Claim, leaseUntil time.Time) {
 	log := e.log.With("run_id", c.RunID, "step_id", c.StepID, "attempt", c.Attempt)
 	typ := string(c.Step.Type)
 	start := time.Now()
 
 	// stepCtx is cancelled, with the reason as its cause, when the heartbeat
-	// finds the lease lost or the run cancelled, or when shutdown runs out of
-	// grace (through stepsCtx).
+	// finds the lease lost or the run cancelled, when the lease runs out
+	// without being renewed, or when shutdown runs out of grace (through
+	// stepsCtx).
 	stepCtx, cancelStep := context.WithCancelCause(stepsCtx)
 	defer cancelStep(nil)
 
-	stopHeartbeat := e.startHeartbeat(stepCtx, c, cancelStep, log)
+	stopHeartbeat := e.startHeartbeat(stepCtx, c, leaseUntil, cancelStep, log)
 	out, err := e.execute(stepCtx, c)
 	stopHeartbeat()
 	took := time.Since(start)
@@ -111,6 +124,13 @@ func (e *Engine) runStep(stepsCtx context.Context, c *store.Claim) {
 
 	result, finished, serr := e.record(stepsCtx, c, out, err)
 	switch {
+	case errors.Is(serr, store.ErrLeaseLost) && e.runCancelled(stepsCtx, c.RunID):
+		// pgstore's CancelRun takes running steps away too, so a cancel that
+		// lands after the step finished but before its result was saved
+		// looks like a lost lease. Count it as the cancel it is: "lost" is
+		// meant for crashed or cut-off workers, and users cancel runs often.
+		result = resultCancelled
+		log.Info("run cancelled before the result was saved, result discarded")
 	case errors.Is(serr, store.ErrLeaseLost):
 		result = resultLost
 		log.Info("lease lost before the result was saved, result discarded")
@@ -194,34 +214,73 @@ func (e *Engine) record(ctx context.Context, c *store.Claim, out json.RawMessage
 	return result, "", nil
 }
 
+// runCancelled reports whether the run is cancelled. It only picks the label
+// of an outcome that is already decided, so an error just means "no".
+func (e *Engine) runCancelled(ctx context.Context, runID string) bool {
+	r, err := e.store.GetRun(ctx, runID)
+	return err == nil && r.Status == store.RunCancelled
+}
+
 // startHeartbeat renews c's lease every Lease/3 until the returned stop
 // function is called. Renewing well before expiry means one slow or failed
 // heartbeat does not lose the lease. If the store says the lease is lost or
 // the run was cancelled, it cancels the step with that error as the cause.
+//
+// It also tracks when the lease runs out, leaseUntil, on the local monotonic
+// clock. If heartbeats keep failing with other errors (the database is
+// unreachable, calls hang) until then, it cancels the step with
+// errLeaseExpired: from that moment another instance may re-claim the step,
+// and fencing only protects the stored result, not the step's side effects,
+// such as an HTTP call made twice at the same time. The expiry the store
+// returns is not used, because it is on the database server's clock.
+//
 // stop waits for the goroutine to exit, so no heartbeat outlives its step.
-func (e *Engine) startHeartbeat(stepCtx context.Context, c *store.Claim, cancelStep context.CancelCauseFunc, log *slog.Logger) (stop func()) {
+func (e *Engine) startHeartbeat(stepCtx context.Context, c *store.Claim, leaseUntil time.Time, cancelStep context.CancelCauseFunc, log *slog.Logger) (stop func()) {
 	ctx, cancel := context.WithCancel(stepCtx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		t := time.NewTicker(max(e.cfg.Lease/3, time.Millisecond))
+		interval := max(e.cfg.Lease/3, time.Millisecond)
+		t := time.NewTicker(interval)
 		defer t.Stop()
+		expiry := time.NewTimer(time.Until(leaseUntil))
+		defer expiry.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+			case <-expiry.C:
 			}
-			_, err := e.store.Heartbeat(ctx, c, e.cfg.Lease)
+			if !time.Now().Before(leaseUntil) {
+				log.Warn("lease ran out before a heartbeat could renew it, stopping the step", "lease", e.cfg.Lease)
+				cancelStep(errLeaseExpired)
+				return
+			}
+
+			// Read the clock before the call, as before a claim. Bound the
+			// call too: one that hangs must not keep this loop from seeing
+			// the lease run out, and the next tick may get a working
+			// connection.
+			sent := time.Now()
+			deadline := sent.Add(interval)
+			if leaseUntil.Before(deadline) {
+				deadline = leaseUntil
+			}
+			hbCtx, hbCancel := context.WithDeadline(ctx, deadline)
+			_, err := e.store.Heartbeat(hbCtx, c, e.cfg.Lease)
+			hbCancel()
 			switch {
+			case err == nil:
+				leaseUntil = sent.Add(e.cfg.Lease)
+				expiry.Reset(time.Until(leaseUntil))
 			case errors.Is(err, store.ErrLeaseLost), errors.Is(err, store.ErrRunCancelled):
 				cancelStep(err)
 				return
-			case err != nil && ctx.Err() == nil:
-				// Probably transient; the lease still has time left, so try
-				// again at the next tick. Fencing keeps this safe even if the
-				// lease does run out meanwhile.
-				log.Warn("heartbeat failed", "err", err)
+			case ctx.Err() == nil:
+				// Probably transient: try again at the next tick, while the
+				// lease still has time left.
+				log.Warn("heartbeat failed", "err", err, "lease_left", time.Until(leaseUntil))
 			}
 		}
 	}()

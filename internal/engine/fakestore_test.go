@@ -27,6 +27,10 @@ type fakeStore struct {
 	claimErrors int // how many upcoming ClaimStep calls fail
 	claimCalls  int
 	writes      []fakeWrite // CompleteStep and FailStep calls, fenced out or not
+
+	// heartbeatFault, when set, runs instead of every Heartbeat, without f.mu
+	// held (it may block), to act like a store the worker cannot reach.
+	heartbeatFault func(ctx context.Context) error
 }
 
 type fakeRun struct {
@@ -210,6 +214,13 @@ func (f *fakeStore) fenced(c *store.Claim) (*fakeRun, *fakeStep, error) {
 
 func (f *fakeStore) Heartbeat(ctx context.Context, c *store.Claim, lease time.Duration) (time.Time, error) {
 	f.mu.Lock()
+	fault := f.heartbeatFault
+	f.mu.Unlock()
+	if fault != nil {
+		return time.Time{}, fault(ctx)
+	}
+
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, s, err := f.fenced(c)
 	if err != nil {
@@ -287,6 +298,14 @@ func (f *fakeStore) failClaims(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claimErrors = n
+}
+
+// breakHeartbeats makes every later Heartbeat call return fault(ctx) instead
+// of renewing the lease.
+func (f *fakeStore) breakHeartbeats(fault func(ctx context.Context) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heartbeatFault = fault
 }
 
 // claims returns how many times ClaimStep was called.

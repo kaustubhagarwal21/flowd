@@ -16,8 +16,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kaustubhagarwal21/flowd/internal/engine"
+	"github.com/kaustubhagarwal21/flowd/internal/jsonb"
 	"github.com/kaustubhagarwal21/flowd/internal/store"
 	"github.com/kaustubhagarwal21/flowd/internal/workflow"
 )
@@ -44,7 +46,7 @@ func NewHTTP(client *http.Client) engine.Executor {
 // httpOutput is the step output of a successful http step.
 type httpOutput struct {
 	Status int             `json:"status"`
-	Body   json.RawMessage `json:"body"` // JSON if the body was valid JSON, else a JSON string
+	Body   json.RawMessage `json:"body"` // JSON if jsonb can store the body, else a JSON string
 }
 
 func (h *httpExecutor) Execute(ctx context.Context, c *store.Claim) (json.RawMessage, error) {
@@ -116,18 +118,22 @@ func statusError(status string, body []byte) error {
 	return fmt.Errorf("HTTP %s: %s", status, b)
 }
 
-// marshalOutput builds {"status":code,"body":...}. A body that is valid JSON
-// is embedded as is; anything else (binary data, or JSON cut short by the
-// size cap) is embedded as a string.
+// marshalOutput builds {"status":code,"body":...}. A body that PostgreSQL's
+// jsonb can store is embedded as JSON; anything else (binary data, JSON cut
+// short by the size cap) is embedded as a string.
 //
-// PostgreSQL's jsonb cannot store the NUL character (\u0000), and a step
-// whose output cannot be saved would be re-run forever. So NUL bytes are
-// dropped from the string form, and JSON that contains a \u0000 escape is
-// kept as a string too (where the escape is just six ordinary characters).
+// A step whose output cannot be saved is re-run each lease, calling a target
+// that succeeded again and again, until it runs out of attempts. jsonb is
+// stricter than json.Valid: it rejects the \u0000 escape, unpaired surrogate
+// escapes such as \ud800, and invalid UTF-8. So valid JSON that jsonb would
+// reject is kept as a string too, where its escapes are ordinary characters.
+// The string itself is made storable: NUL bytes are dropped, and invalid
+// UTF-8 becomes U+FFFD.
 func marshalOutput(status int, body []byte) (json.RawMessage, error) {
 	b := json.RawMessage(body)
-	if !json.Valid(body) || bytes.Contains(body, []byte(`\u0000`)) {
-		s, err := json.Marshal(strings.ReplaceAll(string(body), "\x00", ""))
+	if !jsonb.Storable(body) {
+		text := strings.ToValidUTF8(strings.ReplaceAll(string(body), "\x00", ""), string(utf8.RuneError))
+		s, err := json.Marshal(text)
 		if err != nil {
 			return nil, err
 		}

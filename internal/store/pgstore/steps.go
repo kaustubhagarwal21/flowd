@@ -43,12 +43,46 @@ JOIN runs AS run ON run.id = picked.run_id
 WHERE s.run_id = picked.run_id AND s.step_id = picked.step_id
 RETURNING s.run_id, s.step_id, s.attempt, s.lease_expires_at, s.step_def, run.input`
 
+// sweepInterval is how often busy claims look for dead steps. A claim that
+// finds nothing to run always looks.
+const sweepInterval = time.Second
+
 // ClaimStep leases one runnable step to owner for lease, or returns (nil,
 // nil) when nothing is runnable.
+//
+// It also fails dead steps (see failDeadSteps). Doing that before every
+// claim cost one more query per step, so the sweep runs only when the claim
+// found nothing, or when sweepInterval has passed while claims kept finding
+// work, which bounds how long a dead step waits. The sweep only fails steps
+// and runs, so it can never make a step runnable that the claim missed.
 func (s *Store) ClaimStep(ctx context.Context, owner string, lease time.Duration) (*store.Claim, error) {
-	if err := s.failDeadSteps(ctx); err != nil {
+	c, err := s.claim(ctx, owner, lease)
+	if err != nil {
 		return nil, err
 	}
+	if c != nil && !s.sweepDue() {
+		return c, nil
+	}
+	s.lastSweep.Store(time.Now().UnixNano())
+	serr := s.failDeadSteps(ctx)
+	if c != nil {
+		// The step is leased now and must be handed out, or it would sit
+		// unused until its lease expired. The next sweep retries.
+		return c, nil
+	}
+	return nil, serr
+}
+
+// sweepDue reports whether a busy claim should sweep. The compare-and-swap
+// lets only one of the workers sharing this Store do it per interval.
+func (s *Store) sweepDue() bool {
+	last := s.lastSweep.Load()
+	now := time.Now().UnixNano()
+	return now-last >= int64(sweepInterval) && s.lastSweep.CompareAndSwap(last, now)
+}
+
+// claim runs claimSQL.
+func (s *Store) claim(ctx context.Context, owner string, lease time.Duration) (*store.Claim, error) {
 	c := &store.Claim{Owner: owner}
 	var stepDef, input []byte
 	err := s.pool.QueryRow(ctx, claimSQL, owner, lease.Seconds()).
@@ -79,6 +113,11 @@ type deadStep struct {
 // transaction. The UPDATE checks the step again under the run lock, because
 // another claimer may have failed it already, or its worker may have renewed
 // the lease just in time.
+//
+// A dead step whose run is locked is left for a later sweep. Waiting for
+// the lock would make every claim of every instance wait behind one stuck
+// transaction, and the dead step of a stuck run is exactly what that
+// transaction's owner leaves behind when it freezes.
 func (s *Store) failDeadSteps(ctx context.Context) error {
 	rows, _ := s.pool.Query(ctx, `
 		SELECT st.run_id, st.step_id, st.attempt
@@ -91,8 +130,13 @@ func (s *Store) failDeadSteps(ctx context.Context) error {
 		return fmt.Errorf("pgstore: find expired steps: %w", err)
 	}
 	for _, d := range dead {
-		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-			if _, err := lockRun(ctx, tx, d.RunID); err != nil {
+		err := pgx.BeginTxFunc(ctx, s.pool, s.writeTx, func(tx pgx.Tx) error {
+			var status store.RunStatus
+			err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = $1 FOR UPDATE SKIP LOCKED`, d.RunID).Scan(&status)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil // locked by someone else (or deleted): try again next sweep
+			}
+			if err != nil {
 				return err
 			}
 			tag, err := tx.Exec(ctx, `
@@ -150,7 +194,7 @@ func (s *Store) Heartbeat(ctx context.Context, c *store.Claim, lease time.Durati
 // run when every step has succeeded.
 func (s *Store) CompleteStep(ctx context.Context, c *store.Claim, output json.RawMessage) (store.RunStatus, error) {
 	var status store.RunStatus
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := pgx.BeginTxFunc(ctx, s.pool, s.writeTx, func(tx pgx.Tx) error {
 		var err error
 		if status, err = lockRun(ctx, tx, c.RunID); err != nil {
 			return fencedOut(err)
@@ -206,7 +250,7 @@ func (s *Store) CompleteStep(ctx context.Context, c *store.Claim, output json.Ra
 func (s *Store) FailStep(ctx context.Context, c *store.Claim, errMsg string, retryAt *time.Time) (store.RunStatus, error) {
 	errMsg = cleanText(errMsg)
 	var status store.RunStatus
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := pgx.BeginTxFunc(ctx, s.pool, s.writeTx, func(tx pgx.Tx) error {
 		var err error
 		if status, err = lockRun(ctx, tx, c.RunID); err != nil {
 			return fencedOut(err)
@@ -267,7 +311,8 @@ func failRun(ctx context.Context, tx pgx.Tx, runID string) error {
 }
 
 // lockRun locks the run's row until the transaction ends and returns the
-// run's status. The package comment explains why.
+// run's status. The package comment explains why. The transaction must be
+// begun with s.writeTx.
 func lockRun(ctx context.Context, tx pgx.Tx, runID string) (store.RunStatus, error) {
 	var status store.RunStatus
 	err := tx.QueryRow(ctx, `SELECT status FROM runs WHERE id = $1 FOR UPDATE`, runID).Scan(&status)

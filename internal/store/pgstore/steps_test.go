@@ -2,12 +2,16 @@ package pgstore_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/kaustubhagarwal21/flowd/internal/store"
+	"github.com/kaustubhagarwal21/flowd/internal/store/pgstore"
 	"github.com/kaustubhagarwal21/flowd/internal/store/pgstore/pgtest"
 	"github.com/kaustubhagarwal21/flowd/internal/workflow"
 )
@@ -375,9 +379,168 @@ func TestListRunsPagination(t *testing.T) {
 	if err != nil || len(runs) != 0 {
 		t.Fatalf("ListRuns(bad workflow id) = %+v, %v; want no runs", runs, err)
 	}
-	for _, bad := range []string{"%%%", "bm90IGEgY3Vyc29y", "MTIzLG5vdC1hLXV1aWQ"} {
+	// A forged cursor can hold a time that PostgreSQL's timestamptz cannot
+	// represent. It must be reported as a bad cursor, not as a query error.
+	forged := func(micros string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte(micros + ",00000000-0000-0000-0000-000000000000"))
+	}
+	for _, bad := range []string{"%%%", "bm90IGEgY3Vyc29y", "MTIzLG5vdC1hLXV1aWQ",
+		forged("-300000000000000000"), forged("9223372036854775807"), forged("-9223372036854775808")} {
 		_, _, err := st.ListRuns(ctx, store.ListRunsFilter{Cursor: bad})
 		wantErr(t, "ListRuns(cursor "+bad+")", err, store.ErrInvalidCursor)
+	}
+}
+
+// A run lock held elsewhere, for example by a flowd instance that froze in
+// the middle of a transaction, must not stop claims. Here the locked run
+// has a dead step (its lease expired on its last attempt), which the claim's
+// sweep would fail if it could lock the run.
+func TestLockedRunDoesNotBlockClaims(t *testing.T) {
+	t.Parallel()
+	url := pgtest.NewSchemaURL(t)
+	ctx := context.Background()
+	st, err := pgstore.Open(ctx, url)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	stuck := newRun(t, st, withAttempts(noop("x"), 1))
+	c := claim(t, st, "w1", shortLease)
+	if c == nil || c.RunID != stuck.ID {
+		t.Fatalf("claim = %+v, want step x of run %s", c, stuck.ID)
+	}
+	waitExpiry(c)
+
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) // runs before the schema is dropped, which would wait for it
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE`, stuck.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	claimPromptly := func() *store.Claim {
+		t.Helper()
+		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		start := time.Now()
+		c, err := st.ClaimStep(cctx, "w2", longLease)
+		if err != nil {
+			t.Fatalf("ClaimStep while another session locks run %s: %v (after %v)", stuck.ID, err, time.Since(start))
+		}
+		return c
+	}
+	// Nothing is runnable, so the claim sweeps, and the sweep must pass
+	// over the locked run instead of waiting for it.
+	if c := claimPromptly(); c != nil {
+		t.Fatalf("claimed %s/%s, want nothing runnable", c.RunID, c.StepID)
+	}
+	// Work of other runs is still handed out.
+	other := newRun(t, st, noop("y"))
+	if c := claimPromptly(); c == nil || c.RunID != other.ID || c.StepID != "y" {
+		t.Fatalf("claim = %+v, want step y of run %s", c, other.ID)
+	}
+	wantStatuses(t, st, stuck.ID, "x=running")
+
+	// Skipping is only for now: once the lock is gone, the next sweep fails
+	// the dead step and its run.
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	noClaim(t, st)
+	wantStatuses(t, st, stuck.ID, "x=failed")
+	if got := getRun(t, st, stuck.ID); got.Status != store.RunFailed {
+		t.Fatalf("run = %s, want failed", got.Status)
+	}
+}
+
+// A flowd process that freezes or is cut off while it holds a run lock must
+// lose that lock soon. The workers of healthy instances that complete steps
+// of the same run wait for it, so PostgreSQL has to end the idle session.
+func TestFrozenWriterLosesItsRunLock(t *testing.T) {
+	t.Parallel()
+	url := pgtest.NewSchemaURL(t)
+	ctx := context.Background()
+	st, err := pgstore.Open(ctx, url)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	pgstore.SetIdleTxTimeout(st, 500*time.Millisecond)
+	run := newRun(t, st, noop("a"))
+
+	locked, release := make(chan struct{}), make(chan struct{})
+	held := make(chan error, 1)
+	go func() { held <- pgstore.HoldRunLock(ctx, st, run.ID, locked, release) }()
+	select {
+	case <-locked:
+	case err := <-held:
+		t.Fatalf("HoldRunLock: %v", err)
+	}
+
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	lockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := conn.Exec(lockCtx, `SELECT 1 FROM runs WHERE id = $1 FOR UPDATE`, run.ID); err != nil {
+		t.Fatalf("locking the run held by a frozen session: %v (after %v)", err, time.Since(start))
+	}
+	t.Logf("the frozen session's run lock was released after %v", time.Since(start).Round(time.Millisecond))
+
+	close(release)
+	if err := <-held; err == nil {
+		t.Fatal("the frozen transaction committed; want its session ended by the server")
+	}
+}
+
+// Output that json.Valid accepts but a jsonb column rejects must still be
+// saved. Otherwise CompleteStep fails on every attempt, and a step whose
+// target succeeded runs again until its attempts run out and the run fails.
+// Such output is kept as text, like output that is not JSON at all.
+func TestUnstorableOutputIsSavedAsText(t *testing.T) {
+	t.Parallel()
+	st := pgtest.New(t)
+	ctx := context.Background()
+	cases := []struct{ step, output, want string }{
+		{"nul-escape", `{"x":"a\u0000b"}`, `{"x":"a\u0000b"}`},
+		{"lone-surrogate", `{"x":"\ud800"}`, `{"x":"\ud800"}`},
+		{"invalid-utf8", "{\"x\":\"caf\xe9\"}", "{\"x\":\"caf�\"}"},
+	}
+	var steps []workflow.Step
+	for _, tc := range cases {
+		steps = append(steps, noop(tc.step))
+	}
+	run := newRun(t, st, steps...)
+	for _, tc := range cases {
+		c := mustClaim(t, st, "w", run.ID, tc.step)
+		if _, err := st.CompleteStep(ctx, c, json.RawMessage(tc.output)); err != nil {
+			t.Fatalf("CompleteStep(%s): %v", tc.step, err)
+		}
+	}
+
+	got := getRun(t, st, run.ID)
+	if got.Status != store.RunSucceeded {
+		t.Fatalf("run = %s, want succeeded", got.Status)
+	}
+	for i, tc := range cases {
+		var text string
+		if err := json.Unmarshal(got.Steps[i].Output, &text); err != nil {
+			t.Fatalf("step %s: output %s is not a JSON string: %v", tc.step, got.Steps[i].Output, err)
+		}
+		if text != tc.want {
+			t.Errorf("step %s: output text = %q, want %q", tc.step, text, tc.want)
+		}
 	}
 }
 

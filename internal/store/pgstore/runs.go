@@ -245,7 +245,14 @@ func decodeCursor(c string) (time.Time, string, error) {
 	if err != nil {
 		return time.Time{}, "", err
 	}
-	return time.UnixMicro(n), id, nil
+	// A cursor made by encodeCursor holds a run's created_at. A forged one
+	// can hold a time that timestamptz cannot represent, and the query would
+	// then fail with a server error instead of reporting a bad cursor.
+	t := time.UnixMicro(n).UTC()
+	if t.Year() < 1 || t.Year() > 9999 {
+		return time.Time{}, "", store.ErrInvalidCursor
+	}
+	return t, id, nil
 }
 
 // CancelRun cancels a running run. Its pending and ready steps are
@@ -257,7 +264,7 @@ func (s *Store) CancelRun(ctx context.Context, id string) (store.Run, error) {
 		return store.Run{}, store.ErrNotFound
 	}
 	var run store.Run
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := pgx.BeginTxFunc(ctx, s.pool, s.writeTx, func(tx pgx.Tx) error {
 		status, err := lockRun(ctx, tx, id)
 		if err != nil {
 			return err

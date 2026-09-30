@@ -9,6 +9,12 @@
 // succeed in concurrent transactions that each miss the other's update, and
 // the step would never be promoted. Taking locks in one order (run, then
 // steps) also means these transactions cannot deadlock.
+//
+// A run lock must never be waited for by something that every worker needs,
+// such as a claim: its holder may be a flowd instance that froze or lost its
+// network in the middle of a transaction. Claims therefore lock only step
+// rows, the sweep for dead steps skips locked runs, and the transactions that
+// lock a run limit how long they may sit idle (see idleTxTimeout).
 package pgstore
 
 import (
@@ -19,19 +25,40 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kaustubhagarwal21/flowd/internal/jsonb"
 	"github.com/kaustubhagarwal21/flowd/internal/store"
 )
 
 //go:embed schema.sql
 var schema string
 
+// idleTxTimeout is how long a transaction that locks a run may wait for its
+// client's next statement before PostgreSQL ends the session. flowd sends
+// those statements back to back, so a transaction takes milliseconds. A
+// session idle for this long belongs to a process that froze or was cut off.
+// It still holds the run lock, and without the timeout PostgreSQL would keep
+// it until TCP keepalives notice, which is two hours by default. Meanwhile
+// the workers of healthy instances that complete steps of that run wait.
+const idleTxTimeout = 10 * time.Second
+
 // Store is a store.Store backed by a pgx connection pool.
 type Store struct {
 	pool *pgxpool.Pool
+	// writeTx begins every transaction that locks a run. SET LOCAL applies
+	// idleTxTimeout to that transaction only, and sending it with BEGIN
+	// costs no extra round trip. A startup parameter would cover every
+	// session too, but connection poolers such as PgBouncer refuse
+	// parameters they do not know.
+	writeTx pgx.TxOptions
+	// lastSweep is when a claim last looked for dead steps, in Unix
+	// nanoseconds. See ClaimStep.
+	lastSweep atomic.Int64
 }
 
 var _ store.Store = (*Store)(nil)
@@ -48,7 +75,16 @@ func Open(ctx context.Context, url string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Store{pool: pool}, nil
+	s := &Store{pool: pool}
+	s.setIdleTxTimeout(idleTxTimeout)
+	return s, nil
+}
+
+// setIdleTxTimeout sets the idle limit of the transactions that lock a run.
+// Tests shorten it.
+func (s *Store) setIdleTxTimeout(d time.Duration) {
+	s.writeTx = pgx.TxOptions{BeginQuery: fmt.Sprintf(
+		"BEGIN; SET LOCAL idle_in_transaction_session_timeout = %d", d.Milliseconds())}
 }
 
 // migrate applies the schema in one transaction, unless it is already there.
@@ -137,9 +173,13 @@ func nullJSON(b json.RawMessage) []byte {
 // outputJSON makes a step output storable in a jsonb column. Executors may
 // return any bytes (for example a truncated HTML page), and jsonb rejects
 // anything that is not valid JSON, so such output is kept as a JSON string.
+// json.Valid is not enough: it also accepts invalid UTF-8, \u0000 and lone
+// surrogate escapes, which jsonb rejects. CompleteStep would then fail on
+// every attempt, and a step whose target succeeded would be run again until
+// its run failed.
 func outputJSON(out json.RawMessage) []byte {
 	out = nullJSON(out)
-	if out == nil || json.Valid(out) {
+	if out == nil || jsonb.Storable(out) {
 		return out
 	}
 	b, _ := json.Marshal(cleanText(string(out))) // marshalling a string cannot fail

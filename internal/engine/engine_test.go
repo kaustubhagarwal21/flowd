@@ -54,9 +54,12 @@ func TestRetryWithBackoffThenSuccess(t *testing.T) {
 	flaky.Retry = workflow.RetryPolicy{MaxAttempts: 3, InitialBackoffMS: 20, MaxBackoffMS: 1000}
 	run := createRun(t, st, "retry", flaky)
 	m := metrics.New()
-	startEngine(t, st, engine.Config{Workers: 2, Poll: fast}, realExecutors(), m)
+	_, stop := startEngine(t, st, engine.Config{Workers: 2, Poll: fast}, realExecutors(), m)
 
 	run = waitRunFinished(t, st, run.ID, 5*time.Second)
+	// A worker updates the metrics just after its store write, so wait for
+	// the workers to exit before reading them.
+	stop()
 	if run.Status != store.RunSucceeded {
 		t.Fatalf("run status = %s, want succeeded", run.Status)
 	}
@@ -92,9 +95,10 @@ func TestPermanentErrorIsNotRetried(t *testing.T) {
 		return nil, engine.Permanent(errors.New("target said 400"))
 	})
 	m := metrics.New()
-	startEngine(t, st, engine.Config{Workers: 1, Poll: fast}, execs, m)
+	_, stop := startEngine(t, st, engine.Config{Workers: 1, Poll: fast}, execs, m)
 
 	run = waitRunFinished(t, st, run.ID, 5*time.Second)
+	stop() // so every metric has been recorded
 	if run.Status != store.RunFailed {
 		t.Fatalf("run status = %s, want failed", run.Status)
 	}
@@ -134,7 +138,7 @@ func TestStepFailingInFailedRunIsNotRetried(t *testing.T) {
 	}
 	run := createRun(t, st, "late-failure", newStep("slow", testStepType), newStep("bad", testStepType))
 	m := metrics.New()
-	startEngine(t, st, engine.Config{Workers: 2, Poll: fast}, execs, m)
+	_, stop := startEngine(t, st, engine.Config{Workers: 2, Poll: fast}, execs, m)
 
 	if run = waitRunFinished(t, st, run.ID, 5*time.Second); run.Status != store.RunFailed {
 		t.Fatalf("run status = %s, want failed", run.Status)
@@ -144,6 +148,7 @@ func TestStepFailingInFailedRunIsNotRetried(t *testing.T) {
 		r, err := st.GetRun(context.Background(), run.ID)
 		return err == nil && stepOf(t, r, "slow").Status == store.StepFailed
 	})
+	stop() // so every metric has been recorded
 	wantMetric(t, m, `flowd_steps_executed_total{result="failure",type="test"} 2`)
 	wantMetric(t, m, `flowd_runs_finished_total{status="failed"} 1`)
 	if hasMetric(m, `flowd_steps_executed_total{result="retry"`) {
